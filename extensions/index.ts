@@ -22,6 +22,7 @@ import {
 	createLsTool,
 	createReadTool,
 	createWriteTool,
+	getSettingsListTheme,
 } from "@mariozechner/pi-coding-agent";
 import {
 	Box,
@@ -33,7 +34,9 @@ import {
 	imageFallback,
 	Markdown,
 	Spacer,
+	SettingsList,
 	Text,
+	type SettingItem,
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
@@ -68,6 +71,7 @@ let toolBackgroundMode: "default" | "transparent" | "outlines" = "transparent";
 
 interface SettingsFile {
 	toolBackground?: "default" | "transparent" | "outlines" | "border";
+	hiddenFooterStatusKeys?: string[];
 	readOutputMode?: "hidden" | "summary" | "preview";
 	searchOutputMode?: "hidden" | "count" | "preview";
 	mcpOutputMode?: "hidden" | "summary" | "preview";
@@ -113,29 +117,35 @@ interface SettingsFile {
 
 let _settingsCache: { value: SettingsFile; timestamp: number } | null = null;
 const SETTINGS_CACHE_TTL_MS = 5_000;
+const KNOWN_FOOTER_STATUS_KEYS = ["extmgr", "mcp", "mcp-auth", "subagent-slash"] as const;
+const seenFooterStatusKeys = new Set<string>(KNOWN_FOOTER_STATUS_KEYS);
+let hiddenFooterStatusKeys = new Set<string>();
+
+function getPiSettingsHome(): string {
+	return process.env.HOME ?? process.env.USERPROFILE ?? "";
+}
 
 function readSettings(): SettingsFile {
 	const now = Date.now();
 	if (_settingsCache && now - _settingsCache.timestamp < SETTINGS_CACHE_TTL_MS) {
 		return _settingsCache.value;
 	}
-	const paths = [`${process.cwd()}/.pi/settings.json`, `${process.env.HOME ?? ""}/.pi/settings.json`];
+	const home = getPiSettingsHome();
+	const paths = [`${home}/.pi/settings.json`, `${process.cwd()}/.pi/settings.json`];
+	let merged: SettingsFile = {};
 	for (const path of paths) {
 		try {
 			if (!path || !existsSync(path)) continue;
 			const raw = JSON.parse(readFileSync(path, "utf8"));
 			if (raw && typeof raw === "object") {
-				const result = raw as SettingsFile;
-				_settingsCache = { value: result, timestamp: now };
-				return result;
+				merged = { ...merged, ...(raw as SettingsFile) };
 			}
 		} catch {
 			// ignore invalid settings files
 		}
 	}
-	const empty: SettingsFile = {};
-	_settingsCache = { value: empty, timestamp: now };
-	return empty;
+	_settingsCache = { value: merged, timestamp: now };
+	return merged;
 }
 
 // Cross-extension bust signal for spinner.ts — it watches this counter on
@@ -150,7 +160,7 @@ function bustSpinnerSettingsCache(): void {
 
 function writeSettingsKey(key: string, value: unknown): void {
 	_settingsCache = null; // invalidate cache on write
-	const home = process.env.HOME ?? "";
+	const home = getPiSettingsHome();
 	if (!home) return;
 	const dir = `${home}/.pi`;
 	const path = `${dir}/settings.json`;
@@ -167,6 +177,253 @@ function writeSettingsKey(key: string, value: unknown): void {
 		mkdirSync(dir, { recursive: true });
 		writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
 	} catch { /* best effort */ }
+}
+
+function normalizeFooterStatusKeys(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return [...new Set(value
+		.filter((item): item is string => typeof item === "string")
+		.map((item) => item.trim())
+		.filter((item) => item.length > 0))].sort((a, b) => a.localeCompare(b));
+}
+
+function syncHiddenFooterStatusKeysFromSettings(): void {
+	hiddenFooterStatusKeys = new Set(normalizeFooterStatusKeys(readSettings().hiddenFooterStatusKeys));
+}
+
+function persistHiddenFooterStatusKeys(keys: Iterable<string>): void {
+	const normalized = normalizeFooterStatusKeys([...keys]);
+	hiddenFooterStatusKeys = new Set(normalized);
+	writeSettingsKey("hiddenFooterStatusKeys", normalized.length > 0 ? normalized : undefined);
+}
+
+function getConfigurableFooterStatusKeys(): string[] {
+	return [...new Set([...KNOWN_FOOTER_STATUS_KEYS, ...seenFooterStatusKeys, ...hiddenFooterStatusKeys])].sort((a, b) => a.localeCompare(b));
+}
+
+function updateHiddenFooterStatusKey(key: string, hidden: boolean): void {
+	const normalizedKey = key.trim();
+	if (!normalizedKey) return;
+	seenFooterStatusKeys.add(normalizedKey);
+	const next = new Set(hiddenFooterStatusKeys);
+	if (hidden) next.add(normalizedKey);
+	else next.delete(normalizedKey);
+	persistHiddenFooterStatusKeys(next);
+}
+
+function footerStatusSummary(): string {
+	const hidden = [...hiddenFooterStatusKeys].sort((a, b) => a.localeCompare(b));
+	if (hidden.length === 0) return "Statusline: mostrando todos os segmentos conhecidos";
+	const visible = getConfigurableFooterStatusKeys().filter((key) => !hiddenFooterStatusKeys.has(key));
+	return `Statusline: ocultos [${hidden.join(", ")}] · visíveis [${visible.join(", ") || "nenhum"}]`;
+}
+
+function sanitizeFooterStatusText(text: string): string {
+	return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
+}
+
+function formatFooterTokens(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
+	return `${Math.round(count / 1000000)}M`;
+}
+
+function formatFooterCwd(cwd: string, home: string | undefined): string {
+	if (!home) return cwd;
+	const resolvedCwd = resolve(cwd);
+	const resolvedHome = resolve(home);
+	const rel = relative(resolvedHome, resolvedCwd);
+	const isInsideHome = rel === "" || (rel !== ".." && !rel.startsWith("..\\") && !rel.startsWith("../"));
+	if (!isInsideHome) return cwd;
+	return rel === "" ? "~" : `~/${rel.replace(/\\/g, "/")}`;
+}
+
+function isAutoCompactionEnabled(): boolean {
+	const settings = readSettings() as SettingsFile & { compaction?: { enabled?: boolean } };
+	return settings.compaction?.enabled ?? true;
+}
+
+function deriveFooterModelState(ctx: any): { provider?: string; modelId: string; reasoning: boolean; thinkingLevel: string } {
+	let provider = ctx.model?.provider as string | undefined;
+	let modelId = ctx.model?.id ?? "no-model";
+	let thinkingLevel = typeof ctx.sessionManager?.getThinkingLevel === "function" ? ctx.sessionManager.getThinkingLevel() : "off";
+	for (const entry of ctx.sessionManager?.getEntries?.() ?? []) {
+		if (entry?.type === "model_change") {
+			provider = entry.provider;
+			modelId = entry.modelId;
+		}
+		if (entry?.type === "thinking_level_change") {
+			thinkingLevel = entry.thinkingLevel;
+		}
+	}
+	return {
+		provider,
+		modelId,
+		reasoning: !!ctx.model?.reasoning,
+		thinkingLevel,
+	};
+}
+
+function applyStatuslineFooter(ctx: any): void {
+	if (!ctx?.hasUI) return;
+	syncHiddenFooterStatusKeysFromSettings();
+	ctx.ui.setFooter((tui: any, theme: Theme, footerData: any) => {
+		const unsub = footerData.onBranchChange(() => tui.requestRender());
+		return {
+			dispose: unsub,
+			invalidate() {},
+			render(width: number): string[] {
+				const entries = ctx.sessionManager?.getEntries?.() ?? [];
+				let totalInput = 0;
+				let totalOutput = 0;
+				let totalCacheRead = 0;
+				let totalCacheWrite = 0;
+				let totalCost = 0;
+				let latestCacheHitRate: number | undefined;
+				for (const entry of entries) {
+					if (entry?.type !== "message" || entry.message?.role !== "assistant") continue;
+					const usage = entry.message.usage;
+					if (!usage) continue;
+					totalInput += usage.input ?? 0;
+					totalOutput += usage.output ?? 0;
+					totalCacheRead += usage.cacheRead ?? 0;
+					totalCacheWrite += usage.cacheWrite ?? 0;
+					totalCost += usage.cost?.total ?? 0;
+					const latestPromptTokens = (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+					latestCacheHitRate = latestPromptTokens > 0 ? ((usage.cacheRead ?? 0) / latestPromptTokens) * 100 : undefined;
+				}
+
+				const contextUsage = typeof ctx.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
+				const contextWindow = contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+				const contextPercentValue = contextUsage?.percent ?? 0;
+				const contextPercent = contextUsage?.percent !== null && contextUsage?.percent !== undefined ? contextPercentValue.toFixed(1) : "?";
+
+				let pwd = formatFooterCwd(ctx.sessionManager?.getCwd?.() ?? ctx.cwd, process.env.HOME || process.env.USERPROFILE);
+				const branch = footerData.getGitBranch();
+				if (branch) pwd = `${pwd} (${branch})`;
+				const sessionName = ctx.sessionManager?.getSessionName?.();
+				if (sessionName) pwd = `${pwd} • ${sessionName}`;
+
+				const statsParts: string[] = [];
+				if (totalInput) statsParts.push(`↑${formatFooterTokens(totalInput)}`);
+				if (totalOutput) statsParts.push(`↓${formatFooterTokens(totalOutput)}`);
+				if (totalCacheRead) statsParts.push(`R${formatFooterTokens(totalCacheRead)}`);
+				if (totalCacheWrite) statsParts.push(`W${formatFooterTokens(totalCacheWrite)}`);
+				if ((totalCacheRead > 0 || totalCacheWrite > 0) && latestCacheHitRate !== undefined) {
+					statsParts.push(`CH${latestCacheHitRate.toFixed(1)}%`);
+				}
+				const usingSubscription = !!ctx.model && !!ctx.modelRegistry?.isUsingOAuth?.(ctx.model);
+				if (totalCost || usingSubscription) statsParts.push(`$${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`);
+
+				const autoIndicator = isAutoCompactionEnabled() ? " (auto)" : "";
+				const contextPercentDisplay = contextPercent === "?"
+					? `?/${formatFooterTokens(contextWindow)}${autoIndicator}`
+					: `${contextPercent}%/${formatFooterTokens(contextWindow)}${autoIndicator}`;
+				let contextPercentStr = contextPercentDisplay;
+				if (contextPercentValue > 90) contextPercentStr = theme.fg("error", contextPercentDisplay);
+				else if (contextPercentValue > 70) contextPercentStr = theme.fg("warning", contextPercentDisplay);
+				statsParts.push(contextPercentStr);
+
+				let statsLeft = statsParts.join(" ");
+				let statsLeftWidth = visibleWidth(statsLeft);
+				if (statsLeftWidth > width) {
+					statsLeft = truncateToWidth(statsLeft, width, "...");
+					statsLeftWidth = visibleWidth(statsLeft);
+				}
+
+				const modelState = deriveFooterModelState(ctx);
+				let rightSideWithoutProvider = modelState.modelId;
+				if (modelState.reasoning) {
+					rightSideWithoutProvider = modelState.thinkingLevel === "off"
+						? `${modelState.modelId} • thinking off`
+						: `${modelState.modelId} • ${modelState.thinkingLevel}`;
+				}
+				let rightSide = rightSideWithoutProvider;
+				if (footerData.getAvailableProviderCount() > 1 && modelState.provider) {
+					rightSide = `(${modelState.provider}) ${rightSideWithoutProvider}`;
+					if (statsLeftWidth + 2 + visibleWidth(rightSide) > width) rightSide = rightSideWithoutProvider;
+				}
+				const rightSideWidth = visibleWidth(rightSide);
+				const totalNeeded = statsLeftWidth + 2 + rightSideWidth;
+				let statsLine: string;
+				if (totalNeeded <= width) {
+					statsLine = statsLeft + " ".repeat(width - statsLeftWidth - rightSideWidth) + rightSide;
+				} else {
+					const availableForRight = width - statsLeftWidth - 2;
+					if (availableForRight > 0) {
+						const truncatedRight = truncateToWidth(rightSide, availableForRight, "");
+						statsLine = statsLeft + " ".repeat(Math.max(0, width - statsLeftWidth - visibleWidth(truncatedRight))) + truncatedRight;
+					} else {
+						statsLine = statsLeft;
+					}
+				}
+
+				const pwdLine = truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "..."));
+				const remainder = statsLine.slice(statsLeft.length);
+				const lines = [pwdLine, theme.fg("dim", statsLeft) + theme.fg("dim", remainder)];
+
+				const filteredStatuses = (Array.from(footerData.getExtensionStatuses().entries()) as Array<[string, string]>)
+					.filter(([key]) => {
+						seenFooterStatusKeys.add(key);
+						return !hiddenFooterStatusKeys.has(key);
+					})
+					.sort(([a], [b]) => a.localeCompare(b))
+					.map(([, text]) => sanitizeFooterStatusText(text));
+				if (filteredStatuses.length > 0) {
+					lines.push(truncateToWidth(filteredStatuses.join(" "), width, theme.fg("dim", "...")));
+				}
+				return lines;
+			},
+		};
+	});
+}
+
+async function openStatuslineSettingsPanel(ctx: any): Promise<void> {
+	if (ctx.mode !== "tui") {
+		ctx.ui.notify("/cc-statusline requer modo TUI", "error");
+		return;
+	}
+	syncHiddenFooterStatusKeysFromSettings();
+	const keys = getConfigurableFooterStatusKeys();
+	await ctx.ui.custom((tui: any, theme: Theme, _kb: unknown, done: () => void) => {
+		const items: SettingItem[] = keys.map((key) => ({
+			id: key,
+			label: key,
+			currentValue: hiddenFooterStatusKeys.has(key) ? "hide" : "show",
+			values: ["show", "hide"],
+		}));
+		const container = new Container();
+		container.addChild(new Text(theme.fg("accent", theme.bold("Statusline")), 1, 0));
+		container.addChild(new Text(theme.fg("dim", "Mostra ou oculta segmentos do rodapé por chave. Esc fecha. /cc-statusline reset limpa tudo."), 1, 0));
+		container.addChild(new Spacer(1));
+		const settingsList = new SettingsList(
+			items,
+			Math.min(items.length + 2, 15),
+			getSettingsListTheme(),
+			(id, newValue) => {
+				updateHiddenFooterStatusKey(id, newValue === "hide");
+				applyStatuslineFooter(ctx);
+				tui.requestRender();
+			},
+			() => done(),
+			{ enableSearch: true },
+		);
+		container.addChild(settingsList);
+		return {
+			render(width: number) {
+				return container.render(width);
+			},
+			invalidate() {
+				container.invalidate();
+			},
+			handleInput(data: string) {
+				settingsList.handleInput?.(data);
+				tui.requestRender();
+			},
+		};
+	}, { overlay: true });
 }
 
 function isFffOverrideMode(pi: ExtensionAPI): boolean {
@@ -216,13 +473,62 @@ function stripAnsi(text: string): string {
 	return text.replace(ANSI_RE, "");
 }
 
+const GENTLE_AI_BANNER_INFO_RE = /^\s*(?:GIT|PATH|MCP|PLUGINS|AGENTS|SKILLS|EXTENSIONS|VER|TOOLS):\b/i;
+
+function isGentleAiBannerArtLine(line: string): boolean {
+	const plain = stripAnsi(line).trim();
+	if (!plain) return false;
+	if (/gentle\s+ai/i.test(plain)) return true;
+	const dense = plain.replace(/\s/g, "");
+	if (dense.length === 0) return false;
+	const braille = dense.match(/[\u2800-\u28FF]/g)?.length ?? 0;
+	return braille >= Math.max(8, Math.floor(dense.length * 0.5));
+}
+
+function isGentleAiBannerInfoLine(line: string): boolean {
+	const plain = stripAnsi(line);
+	return GENTLE_AI_BANNER_INFO_RE.test(plain) || /\bOn branch\b/i.test(plain);
+}
+
+function stripLeadingGentleAiBannerLines(lines: string[]): string[] {
+	let index = 0;
+	while (index < lines.length && !stripAnsi(lines[index]).trim()) index++;
+	if (index >= lines.length) return lines;
+	if (!isGentleAiBannerArtLine(lines[index]) && !isGentleAiBannerInfoLine(lines[index])) return lines;
+
+	let end = index;
+	let artCount = 0;
+	let infoCount = 0;
+	let sawGentleLabel = false;
+	while (end < lines.length) {
+		const plain = stripAnsi(lines[end]).trim();
+		if (!plain) {
+			end++;
+			continue;
+		}
+		const isArt = isGentleAiBannerArtLine(lines[end]);
+		const isInfo = isGentleAiBannerInfoLine(lines[end]);
+		if (!isArt && !isInfo) break;
+		if (isArt) artCount++;
+		if (isInfo) infoCount++;
+		if (/gentle\s+ai/i.test(plain)) sawGentleLabel = true;
+		end++;
+	}
+
+	const isBanner = sawGentleLabel || infoCount >= 2 || (artCount >= 3 && infoCount >= 1);
+	if (!isBanner) return lines;
+	while (end < lines.length && !stripAnsi(lines[end]).trim()) end++;
+	return lines.slice(end);
+}
+
 function stripRenderedHeadingMarkers(line: string): string {
 	return line.replace(/^((?:\x1b\[[0-9;]*m|[ \t])*)#{3,6}[ \t]*((?:\x1b\[[0-9;]*m)*)/, "$1$2");
 }
 
 function sanitizeRenderedTextBlockLines(lines: string[]): string[] {
 	let inFence = false;
-	return lines.map((line) => {
+	const withoutGentleBanner = stripLeadingGentleAiBannerLines(lines);
+	return withoutGentleBanner.map((line) => {
 		const plain = stripAnsi(line).trimStart();
 		if (plain.startsWith("```")) {
 			inFence = !inFence;
@@ -973,7 +1279,7 @@ function toolHeader(tool: string, summary: string, theme: Theme, prefix = ""): s
 	applyThemePaletteIfNeeded(theme);
 	const label = theme.fg("toolTitle", theme.bold(tool));
 	if (!summary) return `${prefix}${label}`;
-	return `${prefix}${label} ${WRAP_MARK}${theme.fg("accent", summary)}`;
+	return `${prefix}${label} ${WRAP_MARK}${theme.fg("muted", summary)}`;
 }
 
 function setToolStatus(ctx: any, status: "pending" | "success" | "error"): void {
@@ -1340,9 +1646,7 @@ function clearBlinkTimer(ctx: any): void {
 
 function blinkDot(ctx: any, theme: Theme): string {
 	setupBlinkTimer(ctx);
-	const key = getBlinkKey(ctx);
-	if (key?._blinkActive !== true) return theme.fg("muted", "○");
-	return _globalBlinkPhase ? theme.fg("success", "●") : theme.fg("muted", "○");
+	return theme.fg("success", "●");
 }
 
 // ---------------------------------------------------------------------------
@@ -3814,6 +4118,67 @@ export default function (pi: ExtensionAPI) {
 	patchToolExecutionRenderers();
 	applyDiffPalette();
 	registerThinkingLabels(pi);
+	syncHiddenFooterStatusKeysFromSettings();
+
+	const STATUSLINE_SUBCOMMANDS = ["status", "show", "hide", "toggle", "reset"] as const;
+	pi.registerCommand("cc-statusline", {
+		description: "Configura quais segmentos do statusline/rodapé ficam visíveis",
+		getArgumentCompletions(prefix) {
+			const parts = prefix.split(/\s+/).filter((part) => part.length > 0);
+			if (parts.length <= 1) {
+				const base = parts[0] ?? "";
+				return STATUSLINE_SUBCOMMANDS
+					.filter((value) => value.startsWith(base))
+					.map((value) => ({
+						value,
+						label: value,
+						description:
+							value === "status" ? "Mostra as chaves visíveis e ocultas"
+							: value === "show" ? "Mostra uma chave específica"
+							: value === "hide" ? "Oculta uma chave específica"
+							: value === "toggle" ? "Alterna a visibilidade de uma chave"
+							: "Restaura todas as chaves visíveis",
+					}));
+			}
+			if (["show", "hide", "toggle"].includes(parts[0] ?? "")) {
+				const keyPrefix = parts[1] ?? "";
+				return getConfigurableFooterStatusKeys()
+					.filter((key) => key.startsWith(keyPrefix))
+					.map((key) => ({ value: key, label: key, description: hiddenFooterStatusKeys.has(key) ? "Oculto" : "Visível" }));
+			}
+			return [];
+		},
+		async handler(args, ctx) {
+			syncHiddenFooterStatusKeysFromSettings();
+			const parts = args.trim().split(/\s+/).filter((part) => part.length > 0);
+			const sub = (parts[0] ?? "").toLowerCase();
+			const key = parts.slice(1).join(" ").trim();
+			if (!sub) {
+				await openStatuslineSettingsPanel(ctx);
+				return;
+			}
+			if (sub === "status") {
+				if (ctx.hasUI) ctx.ui.notify(footerStatusSummary(), "info");
+				return;
+			}
+			if (sub === "reset") {
+				persistHiddenFooterStatusKeys([]);
+				applyStatuslineFooter(ctx);
+				if (ctx.hasUI) ctx.ui.notify("Statusline restaurado: todos os segmentos visíveis", "info");
+				return;
+			}
+			if (!["show", "hide", "toggle"].includes(sub) || !key) {
+				if (ctx.hasUI) ctx.ui.notify("Uso: /cc-statusline [status|show <key>|hide <key>|toggle <key>|reset]", "error");
+				return;
+			}
+			seenFooterStatusKeys.add(key);
+			const isHidden = hiddenFooterStatusKeys.has(key);
+			const shouldHide = sub === "hide" ? true : sub === "show" ? false : !isHidden;
+			updateHiddenFooterStatusKey(key, shouldHide);
+			applyStatuslineFooter(ctx);
+			if (ctx.hasUI) ctx.ui.notify(`Statusline ${shouldHide ? "ocultou" : "mostrou"} ${key}`, "info");
+		},
+	});
 
 	// /cc-tools command — toggle tool display style at runtime.
 	// "outlines" is kept as a backward-compatible alias for transparent.
@@ -4032,6 +4397,7 @@ export default function (pi: ExtensionAPI) {
 		patchRtkRewriteNotifications(ctx.ui);
 		applyToolBackgroundMode(ctx.ui.theme);
 		applyThemePaletteIfNeeded(ctx.ui.theme);
+		applyStatuslineFooter(ctx);
 	});
 
 	pi.on("turn_start", async (_event, ctx) => {
@@ -4120,7 +4486,8 @@ export default function (pi: ExtensionAPI) {
 			const details = result.details as BashToolDetails | undefined;
 			const rewrite = ensureRtkRewriteForContext(ctx, ctx.args);
 			const output = result.content[0]?.type === "text" ? result.content[0].text : "";
-			const nonEmpty = output.split("\n").filter((line) => line.trim().length > 0);
+			const sanitizedLines = stripLeadingGentleAiBannerLines(output.split("\n"));
+			const nonEmpty = sanitizedLines.filter((line) => line.trim().length > 0);
 			if (isPartial) {
 				const running = runningPreviewBlock(result, theme.fg("warning", "Running..."), expanded, theme, ctx, {
 					lines: nonEmpty,
